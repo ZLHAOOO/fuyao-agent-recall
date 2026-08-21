@@ -21,6 +21,10 @@ const RECALL = path.join(os.homedir(), ".pi", "agent", "bin", "recall");
 const MAX_CHARS = 300;
 const TIMEOUT_MS = 1500;
 
+// 与 SKILL.md 触发规则对齐：打招呼 / 短回应 / 纯闲聊不值得联想
+const SKIP_RE =
+	/^(你好|您好|hi|hello|hey|嗨|在吗|早|晚上好|ok|okay|好|好的|嗯|嗯嗯|哦|收到|谢谢|多谢|thanks|thank you|不客气|继续|go on|next|辛苦了|晚安)[!！。.~～\s]*$/i;
+
 function runRecall(text: string): Promise<string> {
 	return new Promise((resolve) => {
 		execFile(
@@ -37,7 +41,7 @@ function runRecall(text: string): Promise<string> {
 export default function activate(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		const prompt = (event.prompt || "").trim();
-		if (prompt.length < 4) return;
+		if (prompt.length < 4 || SKIP_RE.test(prompt)) return;
 
 		const hit = await runRecall(prompt);
 		if (!hit) return;
