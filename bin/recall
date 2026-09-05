@@ -224,7 +224,7 @@ def entity_block(text):
     if not hits:
         return []
     ment = find_mentions([e["name"] for e in hits])
-    lines = ["👤 名字→是谁（只认身份，别展开）："]
+    lines = ["👤 Name → who (identity only, don't expand):"]
     for e in hits:
         seg = f"· {e['name']}"
         if e["type"]:
@@ -519,7 +519,7 @@ def cmd_query(a):
         return          # 名字不认识、也没联想到 → 完全沉默（不猜）
     lines = list(ent)
     if res:
-        lines.append("🧠 你的库里可能有相关的（未读取，需要才读）：")
+        lines.append("🧠 Possibly relevant in your memory (not read yet; use only if needed):")
         for r in res:
             why = ("/".join(r["why"]))[:24]
             gist = r.get("gist", "")

@@ -51,12 +51,8 @@ export default function activate(pi: ExtensionAPI) {
 				customType: "recall-primer",
 				content:
 					hit.slice(0, MAX_CHARS) +
-					"\n（以上为浅层联想提示。规则：\n" +
-				"0. 👤 名字→是谁：只取身份即可，不要展开详情；除非本轮任务真的需要这个人/产品的细节\n" +
-					"1. 禁止直接 read 整篇文件！先用 grep -n 关键词 定向搜索确认相关段落\n" +
-					"2. 只在命中 ≥2 个关键词时才读取\n" +
-					"3. 只读取命中行附近 ±5 行，不读全文\n" +
-					"4. 不相关直接忽略，不要强行关联）",
+				"\n(Recall hints only. Grep keywords first; read only matched lines (±5), never whole files. " +
+				"👤 = name→identity, take as-is unless the task truly needs details. Ignore if irrelevant.)",
 				display: false,
 			},
 		};
