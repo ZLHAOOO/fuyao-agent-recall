@@ -120,7 +120,23 @@ recall stats              # Show index stats
 - Supports pi, OpenClaw, Hermes, Claude Code, Cursor directory structures
 - BM25 parameters: k1=1.5, b=0.75
 - Field weights: title×3 / tag×2 / body×1
-- Inject limit: 5 entries / 300 chars
+- Inject limit: 5 entries / 700 chars (with entity identity card)
+- Long-file chunking: files are split into per-section docs at `##` headers (title = file › section), so hits point at the entry, not the whole file
+- Generic 3-gram filtering: BIG_STOP table filters 30+ low-information combinations (Chinese grammatical fragments)
+- Strong hit filtering: when query contains strong terms (English identifiers or 4-grams), weak-only matches require `score ≥ max(1.2, best×0.65)` to be included
+
+## Entity Dictionary (name → who)
+
+BM25 n-grams inherently miss 2-char Chinese names (阿橘/阿旺) and mixed names (Nova99).
+Entity resolution bypasses the index entirely via `memory/entities.md`: the file is read
+fresh on every query (**edit the dictionary → effective on the next turn**). On a hit it
+emits a one-line identity card + where the name appears in the corpus — "hear a name,
+know who it is, expand only when needed".
+
+```bash
+recall q "阿橘是谁"        # → 👤 阿橘〔agent〕…｜详情 relations.md
+recall audit --min 3       # surface recurring names missing from the dictionary (suggest only)
+```
 
 ## Excluded Files
 

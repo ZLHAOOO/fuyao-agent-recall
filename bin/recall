@@ -87,8 +87,155 @@ the a an and or but for with this that what how why can could would should need
 if then so because also very just really some any all one two get make use used
 have has had does did doing about from into your our their there here when where
 """.split())
+# 通用 3-gram：由常用词组合而成，信息量极低，匹配上等于噪音
+BIG_STOP = set("""
+的时候 的问题 的方式 的情况 的想法 的目标 的目的 的意义 的价值
+的东西 的事情 的过程 的结果 的原因 的情况下 的一部分
+的一个 的一种 的一次 的一步 的时候 的问题 的方式
+我们 你们 他们 她们 它们 这个 那个 这些 那些
+可以 可能 可是 但是 而是 而且 所以 因为 如果 虽然 或者 不过
+什么 怎么 怎样 为什么 是否 如何 哪里 哪儿 哪个 哪些
+""".split())
 MIN_LEN = 2
 TOP_N = 5
+ENT_FILE = os.path.join(BASE, "memory", "entities.md")
+# 这些词虽然登记在词典里，但属于日常用语，每次触发等于噪音 → 不出身份卡
+GENERIC = {"老大", "自己", "我们", "对方", "客户"}
+
+
+def _split_names(cell):
+    """一个单元格可能塞了多个名字：'UserOne / Z'、'公司甲 / 公司乙'。"""
+    cell = cell.replace("**", "").strip().strip("`").strip()
+    parts = re.split(r"\s*/\s*|[、,，]", cell)
+    res = []
+    for p in parts:
+        p = p.strip().strip("`").strip()
+        if len(p) >= 2 and p not in ("—", "-"):
+            res.append(p)
+            # 拉丁全名额外拆出姓氏词，让 'Karpathy' 也能命中 'Andrej Karpathy'
+            for w in re.findall(r"[A-Za-z][A-Za-z]{3,}", p):
+                if w != p and w not in res:
+                    res.append(w)
+    return res[:5]
+
+
+def load_names():
+    """解析 memory/entities.md 的表格 → 实体词典。
+
+    关键设计：**每次查询直接读文件（~2ms），不进 BM25 索引。**
+    于是 ①改词典下一轮立刻生效，不必 recall build；②索引坏了/过期了也不影响认名字。
+    词典与索引解耦。
+    """
+    try:
+        raw = open(ENT_FILE, encoding="utf-8").read()
+    except OSError:
+        return []
+    out, col = [], None
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not any(cells) or set("".join(cells)) <= set("-: "):
+            continue
+        if "名字" in cells[0]:                      # 表头：A/B 档列数不同，按表头动态定位
+            col = {}
+            for i, c in enumerate(cells):
+                if "名字" in c: col["name"] = i
+                elif "别名" in c: col["alias"] = i
+                elif "类型" in c: col["type"] = i
+                elif "是谁" in c: col["who"] = i
+                elif "关系" in c: col["rel"] = i
+                elif "详情" in c: col["detail"] = i
+            continue
+        if not col or "name" not in col or len(cells) <= col["name"]:
+            continue
+        def g(k):
+            i = col.get(k, -1)
+            return cells[i].strip() if 0 <= i < len(cells) else ""
+        who = g("who").replace("**", "")
+        rel = g("rel").replace("**", "")
+        # 名字列 + 别名列都要读（昵称甲是「老大」的别名，不读别名列就永远匹配不到）
+        seen_names = set()
+        for n in _split_names(g("name")) + _split_names(g("alias")):
+            if n in seen_names:
+                continue
+            seen_names.add(n)
+            out.append({"name": n, "type": g("type").replace("**", ""),
+                        "who": who[:56], "rel": rel[:40],
+                        "detail": g("detail").strip("` ")})
+    return out
+
+
+def match_names(text, names):
+    """子串匹配，**绕开中文 2 字名的 n-gram 盲区**（'阿橘'/'阿旺' 抽不出 3-gram）。
+    长名优先并吞掉短名，避免 'Nova99' 又触发一次 'Nova'。"""
+    low = text.lower()
+    hits, seen = [], set()
+    for e in sorted(names, key=lambda x: -len(x["name"])):
+        n = e["name"].lower()
+        if n and n in low and e["name"] not in seen:
+            seen.add(e["name"])
+            hits.append(e)
+            low = low.replace(n, "\x00" * len(n))
+    return [e for e in hits if e["name"] not in GENERIC][:3]
+
+
+def find_mentions(names, per_name=2):
+    """在语料里直接 grep 这些名字 → 「哪个文件第几行 + 原文」。
+    同时绕开 BM25 的分词盲区与 raw[:8000] 截断（长文件后半段本来不可检索）。
+    排序：原始记录（journal/projects/knowledge-base/workspace）优先；
+    词典与详情文件自身的引用不算「在哪里提到过」（那是元数据，不是记忆）。"""
+    res = defaultdict(list)
+    if not names:
+        return res
+
+    def rank(rel):
+        if rel.endswith(("entities.md", "relations.md")):
+            return 0          # 词典/详情自己 → 跳过
+        return 2 if rel.startswith(("memory/journal", "memory/projects",
+                                    "knowledge-base", "workspace")) else 1
+
+    all_hits = defaultdict(list)
+    for p, _ in iter_files():
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        rel = os.path.relpath(p, BASE)
+        r = rank(rel)
+        if r == 0:
+            continue
+        for i, ln in enumerate(raw.splitlines(), 1):
+            for n in names:
+                if n in ln:
+                    t = ln.strip().lstrip("#->* ").replace("**", "")
+                    all_hits[n].append((r, rel, i, t[:64]))
+    for n, rows in all_hits.items():
+        rows.sort(key=lambda x: -x[0])
+        res[n] = [(rel, i, t) for _, rel, i, t in rows[:per_name]]
+    return res
+
+
+def entity_block(text):
+    """名字 → 是谁（一行身份卡）+ 我在哪儿提到过它。返回 [] 表示无命中。"""
+    hits = match_names(text, load_names())
+    if not hits:
+        return []
+    ment = find_mentions([e["name"] for e in hits])
+    lines = ["👤 名字→是谁（只认身份，别展开）："]
+    for e in hits:
+        seg = f"· {e['name']}"
+        if e["type"]:
+            seg += f"〔{e['type']}〕"
+        seg += f" {e['who'] or e['rel']}"
+        if e["detail"]:
+            seg += f"｜详情 {e['detail']}"
+        lines.append(seg[:150])
+        for rel, i, t in ment.get(e["name"], []):
+            lines.append(f"   ↳ {rel}:{i} {t}")
+    return lines
 
 
 def iter_files():
@@ -105,7 +252,7 @@ def iter_files():
 
 
 def tokens(text, keep_stop=False):
-    """抽候选词：中文 2-4 gram + 英文/代码标识符。故意粗糙，宁多勿漏。"""
+    """抽候选词：中文 3-4 gram + 英文/代码标识符。通用 3-gram 被 BIG_STOP 过滤。"""
     out = set()
     for w in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}", text):
         lw = w.lower()
@@ -115,62 +262,117 @@ def tokens(text, keep_stop=False):
         for n in (3, 4):
             for i in range(len(run) - n + 1):
                 g = run[i:i + n]
-                if keep_stop or g not in STOP:
+                if keep_stop or (g not in STOP and g not in BIG_STOP):
                     out.add(g)
     return out
 
 
-def summarize(path):
-    """抽一个文件的：标题、标签、正文词频（Counter）"""
+CHUNK_MAX = 6000   # 单块上限。长文件按 ## 标题切块，同时解决：①8000 截断=静默失忆 ②命中只给文件级指针=标签错位
+
+
+def split_chunks(raw):
+    """长文件切块：按 ## 标题，没有 ## 用 #，都没有按空行窗口。→ [(小节标题, 小节文本)]"""
+    if len(raw) <= CHUNK_MAX:
+        return [("", raw)]
+    ms = list(re.finditer(r"^##\s+(.+)$", raw, re.M))
+    if len(ms) < 2:
+        ms = list(re.finditer(r"^#\s+(.+)$", raw, re.M))
+    out = []
+    if len(ms) >= 2:
+        head = raw[:ms[0].start()]
+        if head.strip():
+            out.append(("", head))
+        for i, m in enumerate(ms):
+            end = ms[i + 1].start() if i + 1 < len(ms) else len(raw)
+            out.append((m.group(1).strip(), raw[m.start():end]))
+    else:                            # 无标题结构 → 空行窗口
+        buf, size = "", 0
+        for para in re.split(r"\n{2,}", raw):
+            if size and size + len(para) > CHUNK_MAX:
+                out.append(("", buf))
+                buf, size = "", 0
+            buf += para + "\n\n"
+            size += len(para)
+        if buf.strip():
+            out.append(("", buf))
+    final = []                       # 单个小节自己超长 → 再切，标「(续)」
+    for sec, seg in out:
+        while len(seg) > CHUNK_MAX:
+            cut = seg.rfind("\n", 0, CHUNK_MAX)
+            cut = cut if cut > 2000 else CHUNK_MAX
+            final.append((sec, seg[:cut]))
+            seg = seg[cut:]
+            if sec:
+                sec = sec + "（续）"
+        final.append((sec, seg))
+    return final
+
+
+def summarize_file(path):
+    """→ 产出 1 个（短文件）或 N 个（长文件切块）索引文档。
+    块级文档：title = 文件标题 › 小节标题，gist = 小节自己的首行 ——
+    命中直接指向「8 月 12 日那条」，而不是「去 8 月 journal 里找」。"""
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            raw = f.read(20000)
+            raw = f.read(60000)      # 旧版这里只读 20000，本身就是一层截断
     except OSError:
-        return None
-    lines = raw.splitlines()
+        return []
+    fname = os.path.basename(path)
     title = ""
-    for ln in lines[:15]:
+    for ln in raw.splitlines()[:15]:
         m = re.match(r"^#\s+(.+)", ln.strip())
         if m:
             title = m.group(1).strip()
             break
     if not title:
-        title = os.path.splitext(os.path.basename(path))[0]
+        title = os.path.splitext(fname)[0]
     tags = re.findall(r"#([\w\u4e00-\u9fff]{2,})", raw)
-    # gist：首段有意义的文字 + 标签（标题单独显示，不重复）
-    gist_parts = []
-    for ln in lines[1:40]:
-        ln2 = ln.strip()
-        if ln2 and not ln2.startswith(("#", ">", "-", "*", "|", "`", "!")) and len(ln2) > 8:
-            # 如果首段文字就是标题的重复，跳过
-            if title and ln2.lower().startswith(title.lower()[:15]):
-                continue
-            gist_parts.append(ln2[:60])
-            break
-    if not gist_parts and title:
-        gist_parts.append(title[:50])
-    if tags:
-        gist_parts.append("#" + " #".join(tags[:3]))
-    gist = " | ".join(gist_parts)[:100]
-    heads = " ".join(re.findall(r"^#{1,3}\s+(.+)$", raw, re.M)[:25])
-    fname = os.path.basename(path)
-    return {
-        "path": os.path.relpath(path, BASE),
-        "title": title[:70],
-        "gist": gist,
-        "w_title": Counter(tokens(title + " " + fname + " " + heads)),
-        "w_tag": Counter(t.lower() for t in tags),
-        "w_body": Counter(tokens(raw[:8000])),
-    }
+
+    def gist_of(text, allow_bullet=False):
+        for ln in text.splitlines()[:40]:
+            s = ln.strip()
+            if allow_bullet and s.startswith("- "):
+                s = s[2:].strip()    # journal 小节全是列表条目，条目即内容
+            if s and not s.startswith(("#", ">", "-", "*", "|", "`", "!")) and len(s) > 8:
+                if title and s.lower().startswith(title.lower()[:15]):
+                    continue
+                return s[:60]
+        return ""
+
+    gist = " | ".join(x for x in [gist_of(raw),
+                                  "#" + " #".join(tags[:3]) if tags else ""] if x)[:100]
+
+    def make_doc(ct, g, seg, sec_title):
+        heads = " ".join(re.findall(r"^#{1,3}\s+(.+)$", seg, re.M)[:25])
+        return {
+            "path": os.path.relpath(path, BASE),
+            "title": ct[:70],
+            "gist": g[:100],
+            "w_title": Counter(tokens(ct + " " + fname + " " + heads + " " + sec_title)),
+            "w_tag": Counter(t2.lower() for t2 in tags),
+            "w_body": Counter(tokens(seg[:8000])),   # 兜底保险，切块后天然够小
+        }
+
+    docs = []
+    for sec_title, seg in split_chunks(raw):
+        ct = f"{title} › {sec_title}" if sec_title else title
+        if sec_title:
+            g = " | ".join(x for x in [gist_of(seg, allow_bullet=True),
+                                       "#" + " #".join(tags[:3]) if tags else ""] if x)
+        else:
+            g = gist
+        docs.append(make_doc(ct, g, seg, sec_title))
+    return docs
 
 
 def cmd_build(a, quiet=False):
     docs, n = [], 0
     for p, w in iter_files():
-        d = summarize(p)
-        if d:
-            d["weight"] = w
-            docs.append(d)
+        ds = summarize_file(p)
+        if ds:
+            for d in ds:
+                d["weight"] = w
+                docs.append(d)
             n += 1
     # 倒排索引：词 → [(doc_idx, field_key, tf)]
     inv = defaultdict(list)
@@ -194,7 +396,7 @@ def cmd_build(a, quiet=False):
         json.dump({"docs": slim, "inv": inv, "dl": dl, "stats": stats, "fp": fingerprint()}, f, ensure_ascii=False)
     if not quiet:
         size = os.path.getsize(IDX) / 1024
-        print(f"✓ 索引已建：{n} 个文件 / {len(inv)} 个词 / {size:.0f}KB → {os.path.relpath(IDX, BASE)}")
+        print(f"✓ 索引已建：{n} 个文件 → {len(docs)} 个检索块 / {len(inv)} 个词 / {size:.0f}KB → {os.path.relpath(IDX, BASE)}")
 
 
 def fingerprint():
@@ -244,9 +446,13 @@ def recall(text, top=TOP_N, auto=True):
     if not q_terms:
         return []
 
+    # 查询里是否有"强词"（非CJK 或 4-gram 中文）？
+    has_strong_q = any(not bool(re.match(r"^[\u4e00-\u9fff]+$", t)) or len(t) >= 4 for t in q_terms)
+
     # 每个文档的 BM25 累积分
     score = defaultdict(float)
-    hits = defaultdict(set)
+    strong_hits = defaultdict(set)  # 强命中：非CJK词 或 4-gram中文
+    weak_hits = defaultdict(set)    # 弱命中：普通 3-gram
 
     for t in q_terms:
         posts = inv.get(t)
@@ -255,6 +461,8 @@ def recall(text, top=TOP_N, auto=True):
         # BM25 IDF：log((N - n + 0.5) / (n + 0.5) + 1)
         n = len({p[0] for p in posts})
         idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0)
+        # 强词判定：非CJK（英文标识符）或 4-gram 中文
+        is_strong = not bool(re.match(r"^[\u4e00-\u9fff]+$", t)) or len(t) >= 4
         # 英文标识符提权（"Tiptap"这种词信息量大）
         is_cjk = bool(re.match(r"^[\u4e00-\u9fff]+$", t))
         term_boost = 2.5 if not is_cjk else (1.0 + max(0, len(t) - 3) * 0.4)
@@ -265,8 +473,12 @@ def recall(text, top=TOP_N, auto=True):
             norm = 1 - B + B * (dlen / max(0.5, avgdl[fld]))
             bm25 = idf * (tf * (K1 + 1)) / (tf + K1 * norm)
             score[i] += bm25 * FIELD_BOOST[fld] * term_boost
-            if fld in ("w_title", "w_tag"):
-                hits[i].add(t)
+            # 强词命中（非CJK / 4-gram中文）无论落在哪个字段都算强——
+            # 正文里的精确短语匹配同样是高精度信号（切块后正文命中是大头，只认 title/tag 会误杀正主）
+            if is_strong:
+                strong_hits[i].add(t)
+            elif fld in ("w_title", "w_tag"):
+                weak_hits[i].add(t)
 
     if not score:
         return []
@@ -275,36 +487,94 @@ def recall(text, top=TOP_N, auto=True):
     best = max(r[1] for r in ranked)
 
     out = []
+    per_path = defaultdict(int)
     for i, sc in ranked[:top]:
         if sc < max(0.15, best * 0.25):
             break
-        if not hits[i] and sc < best * 0.60:
+        # 强命中过滤：查询含强词时，纯弱命中文档需更高分才能入选
+        if has_strong_q and not strong_hits[i] and sc < max(1.2, best * 0.65):
+            continue
+        # 兜底：无 title/tag 命中且分数不够 → 跳过
+        all_hits = strong_hits[i] | weak_hits[i]
+        if not all_hits and sc < best * 0.60:
             continue
         d = docs[i]
+        if per_path[d["path"]] >= 2:      # 同一文件的块最多露 2 个，保结果多样性
+            continue
+        per_path[d["path"]] += 1
+        # why 优先展示强命中
+        why = sorted(strong_hits[i])[:2] + sorted(weak_hits[i])[:1]
         out.append({"path": d["path"], "title": d["title"], "gist": d["gist"],
-                    "score": round(sc, 3), "why": sorted(hits[i])[:3]})
+                    "score": round(sc, 3), "why": why[:3]})
     return out
 
 
 def cmd_query(a):
+    ent = entity_block(a.text)
     res = recall(a.text, a.top)
     if a.json:
-        print(json.dumps(res, ensure_ascii=False, indent=1))
+        print(json.dumps({"entities": ent, "recall": res}, ensure_ascii=False, indent=1))
         return
-    if not res:
-        return          # 没联想到 → 完全沉默
-    lines = ["🧠 你的库里可能有相关的（未读取，需要才读）："]
-    for r in res:
-        why = ("/".join(r["why"]))[:24]
-        gist = r.get("gist", "")
-        head = f"· {r['title']}"
-        if gist and gist != r['title']:
-            head += f" — {gist}"
-        if why:
-            head += f"  ←{why}"
-        lines.append(head)
+    if not ent and not res:
+        return          # 名字不认识、也没联想到 → 完全沉默（不猜）
+    lines = list(ent)
+    if res:
+        lines.append("🧠 你的库里可能有相关的（未读取，需要才读）：")
+        for r in res:
+            why = ("/".join(r["why"]))[:24]
+            gist = r.get("gist", "")
+            head = f"· {r['title']}"
+            if gist and gist != r['title']:
+                head += f" — {gist}"
+            if why:
+                head += f"  ←{why}"
+            lines.append(head)
     txt = "\n".join(lines)
-    print(txt[:300])
+    print(txt[:700])
+
+
+def cmd_audit(a):
+    """反向联动：找出「反复出现但不在词典里」的候选实体。
+
+    阿橘事件的本质是：一个 16 封信的实体，我完全不知道它在漏网。
+    本命令把「不知道自己漏了什么」变成一张可审的清单。
+    **只建议，绝不自动写入 entities.md** —— 收录判断是我的活。
+    """
+    known = {e["name"].lower() for e in load_names()}
+    cand = defaultdict(lambda: [0, "", ""])
+    for p, _ in iter_files():
+        try:
+            raw = open(p, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            continue
+        rel = os.path.relpath(p, BASE)
+        # 名字在中文写作里的高频位置：**加粗**（排除模板字段名：**主标题**：后面紧跟冒号）、
+        # 「引号」、@handle；日期/纯数字/短 ASCII 缩写不算实体
+        for m in re.finditer(r"\*\*([^*\n]{2,14})\*\*(?![：:])|「([^\n」]{2,14})」|"
+                             r"@([A-Za-z0-9_\u4e00-\u9fff]{2,20})", raw):
+            nm = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            if not (2 <= len(nm) <= 12):
+                continue
+            if nm.lower() in known:
+                continue
+            if re.fullmatch(r"[\d\s:.-]+|\d{4}[-年]\d{1,2}([-月]\d{1,2}日?)?", nm):
+                continue
+            if re.search(r"[。！？，、：；\s]", nm):
+                continue
+            if any(c in nm for c in "`|[]()（）#*/"):
+                continue
+            if nm.isascii() and len(nm) < 3:      # kb/tk 这类缩写噪音
+                continue
+            cand[nm][0] += 1
+            if not cand[nm][1]:
+                cand[nm][1] = rel
+                cand[nm][2] = nm
+    rows = [(n, v[0], v[1]) for n, v in cand.items() if v[0] >= a.min]
+    rows.sort(key=lambda x: -x[1])
+    print(f"词典现有 {len(known)} 个名字｜候选实体 {len(rows)} 个（出现≥{a.min} 次且不在词典）")
+    print("→ 人工判断后手动加进 memory/entities.md，本命令不自动写入\n")
+    for n, c, where in rows[:a.top]:
+        print(f"  {c:>3}×  {n}   ← {where}")
 
 
 def cmd_stats(a):
@@ -322,11 +592,15 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("build").set_defaults(fn=cmd_build)
     sub.add_parser("stats").set_defaults(fn=cmd_stats)
+    pa = sub.add_parser("audit", help="找反复出现但不在词典里的候选实体（只建议，不写入）")
+    pa.add_argument("--min", type=int, default=3)
+    pa.add_argument("--top", type=int, default=25)
+    pa.set_defaults(fn=cmd_audit)
     p = sub.add_parser("q")
     p.add_argument("text"); p.add_argument("--top", type=int, default=TOP_N)
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_query)
     argv = sys.argv[1:]
-    if argv and argv[0] not in ("build", "stats", "q", "-h", "--help"):
+    if argv and argv[0] not in ("build", "stats", "audit", "q", "-h", "--help"):
         argv = ["q"] + argv          # 允许 recall "问题"
     a = ap.parse_args(argv)
     if not getattr(a, "cmd", None):
