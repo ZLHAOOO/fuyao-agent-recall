@@ -31,7 +31,9 @@ The value is not in precise search — it's in **giving the model a shallow remi
 | Feature | Description |
 |---|---|
 | **Zero cost** | Pure local BM25 string matching, no API calls |
-| **Ultra-fast** | <100ms, imperceptible to users |
+| **Ultra-fast** | ≈100ms (measured 90-130ms), imperceptible to users |
+| **True-word layer** | jieba Chinese segmentation (2-char words + POS filtering + auto-injected entity dictionary), dual-layer index with n-gram fallback |
+| **SQLite point lookup** | Inverted index in SQLite, queried per-term without loading the whole index — corpus growth doesn't slow queries |
 | **Automatic** | Pi environment via extension hook, runs unconditionally every turn |
 | **Lightweight** | Only injects summary (~300 chars), never full text |
 | **Self-healing** | Auto-rebuilds index when new files detected |
@@ -46,6 +48,7 @@ bash install.sh
 ```
 
 - **Pi environment**: Auto-installs as extension, auto-runs every turn after restart
+- **Optional boost**: `pip install jieba` enables the Chinese true-word layer (build-time only; without it, falls back to pure n-gram — queries unaffected)
 - **Other agents** (Claude Code / Codex / OpenClaw / Cursor): Runs in skill mode, SKILL.md instructs model to run `recall q` every turn
 
 ## Trigger Rules
@@ -132,6 +135,18 @@ Entity resolution bypasses the index entirely via `memory/entities.md`: the file
 fresh on every query (**edit the dictionary → effective on the next turn**). On a hit it
 emits a one-line identity card + where the name appears in the corpus — "hear a name,
 know who it is, expand only when needed".
+Dictionary names are also **auto-injected into jieba's custom dictionary** (tag = proper noun), so segmentation and identity cards stay in sync from a single source.
+
+## Tokenization & Index (v1.1)
+
+**Dual-layer term index** (at build time):
+- **jieba true-word layer**: real words + POS filtering (nouns/proper nouns/English only) + entities.md auto-injected as custom dictionary.
+  **Only 2-char words are kept** — words of 3+ chars naturally overlap with n-grams (3-char word = 3-gram, 4-char word = 4-gram); 2-char words are the actual n-gram blind spot
+- **n-gram fallback layer**: all 3-4 char fragments, nothing missed
+
+**Zero query-side dependency**: queries never load jieba — they use n-grams plus a 2-gram patch to hit true words. The ~1s dictionary load cost is only paid at offline build time.
+
+**SQLite storage**: the inverted index lives in `memory/.recall-index.db`, queried per-term in batches (no full-index load); document metadata lives in a meta table. Previously a 15.8MB JSON full load cost 466ms — now corpus growth no longer affects query latency.
 
 ```bash
 recall q "阿橘是谁"        # → 👤 阿橘〔agent〕…｜详情 relations.md
@@ -162,14 +177,14 @@ TOOLS.md, HEARTBEAT.md, CLAUDE.md, CLAUDE.local.md,
 |---|---|---|
 | Semantic understanding | ✅ "fruit" ≈ "apple" | ❌ String matching |
 | Operational cost | 💰 GPU / API / Storage | 🆓 Zero |
-| Latency | 100-500ms | <100ms |
+| Latency | 100-500ms | ≈100ms (measured 90-130ms) |
 | Transparency | Black box | White box (Markdown) |
 | Best for | Million-scale docs | Personal knowledge base |
 
 ## Limitations
 
 - No semantic search ("fruit" won't match "apple")
-- Chinese based on 3-4 gram, not dictionary segmentation
+- Chinese = jieba 2-char true-word layer + 3-4 gram fallback (requires `pip install jieba`; without it, 2-char words rely on the entity dictionary)
 - Non-pi environments depend on model following instructions
 
 ## Credits
