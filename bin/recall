@@ -13,7 +13,7 @@ K1 = 1.5; B = 0.75
 FIELDS = ("w_title", "w_tag", "w_body")
 FIELD_BOOST = {"w_title": 3.0, "w_tag": 2.0, "w_body": 1.0}
 
-import os, re, sys, json, argparse, hashlib, math
+import os, re, sys, json, argparse, hashlib, math, pickle, sqlite3
 from collections import defaultdict, Counter
 
 def detect_base():
@@ -55,7 +55,7 @@ def detect_base():
     return os.getcwd()
 
 BASE = detect_base()
-IDX = os.path.join(BASE, "memory", ".recall-index.json")
+DB = os.path.join(BASE, "memory", ".recall-index.db")   # SQLite：查询按词点查，不整体加载
 # 自动扫描以下目录（存在才扫）；权重：核心记忆 > 知识库 > 工作区
 SCAN_CANDIDATES = [
     ("memory", 1.3),
@@ -63,6 +63,7 @@ SCAN_CANDIDATES = [
     ("workspace", 0.85),
     ("notes", 1.0),
     ("docs", 0.9),
+    ("skills", 1.0),  # 2026-09-10 补：技能库存进联想半径（此前 fuyao 系 skill 联想不到，盲区）
 ]
 
 def scan_dirs():
@@ -95,6 +96,14 @@ BIG_STOP = set("""
 我们 你们 他们 她们 它们 这个 那个 这些 那些
 可以 可能 可是 但是 而是 而且 所以 因为 如果 虽然 或者 不过
 什么 怎么 怎样 为什么 是否 如何 哪里 哪儿 哪个 哪些
+""".split())
+# 查询侧 2-gram 停用：只滤真正无信息的组合；有信息的 2 字词留给 BM25 的 IDF 自然压权
+STOP2 = set("""
+我们 你们 他们 她们 它们 自己 对方 大家 别人 咱们
+这个 那个 这些 那些 这样 那样 这种 那种 这个样
+可以 可能 可是 但是 而且 所以 因为 如果 虽然 或者 不过 就是 还是
+什么 怎么 怎样 是否 如何 哪个 哪些 的话
+现在 时候 刚才 一下 一直 一定 不是 没有 直接 通过 然后 其实 应该 需要 觉得 感觉
 """.split())
 MIN_LEN = 2
 TOP_N = 5
@@ -251,8 +260,57 @@ def iter_files():
                 yield os.path.join(dirpath, fn), w
 
 
-def tokens(text, keep_stop=False):
-    """抽候选词：中文 3-4 gram + 英文/代码标识符。通用 3-gram 被 BIG_STOP 过滤。"""
+# ---------- jieba 真词层（可选加速） ----------
+# 设计：只有 build 用 jieba（索引侧双层词：jieba 真词 + n-gram 兜底）；
+# 查询路径零依赖零词典加载（q 侧补 2-gram 命中 2 字真词）。
+# jieba 未安装 → build 自动降级纯 n-gram，查询不受影响。
+_JIEBA = None  # None=未探测 / False=不可用 / posseg 模块
+
+
+def _jieba():
+    global _JIEBA
+    if _JIEBA is None:
+        try:
+            import jieba.posseg as _p
+            _JIEBA = _p
+        except Exception:
+            _JIEBA = False
+    return _JIEBA
+
+
+def setup_jieba_dict():
+    """entities.md 的名字+别名注入 jieba 自定义词典（tag='nz' 专名，词性过滤必留）。"""
+    p = _jieba()
+    if not p:
+        return 0
+    import jieba
+    names = [e["name"] for e in load_names()]
+    for w in names:
+        jieba.add_word(w, freq=2_000_000, tag="nz")
+    return len(names)
+
+
+def jieba_terms(text):
+    """jieba 真词，只收 2 字词（索引增量层）。
+    3+ 字词与 n-gram 层天然重合（3 字词=3-gram，4 字词=4-gram），
+    重复入索引只涨体积不涨召回；2 字词才是 n-gram 的盲区（本层存在的理由）。
+    词性过滤：名词系（n*）+ 动名词/形名词/英文。不可用 → 空集。"""
+    p = _jieba()
+    if not p:
+        return set()
+    out = set()
+    for w, pos in p.lcut(text):
+        if len(w) != 2 or w in STOP or w in STOP2:
+            continue
+        if pos.startswith("n") or pos in ("vn", "an", "eng"):
+            out.add(w)
+    return out
+
+
+def tokens(text, keep_stop=False, two_gram=False):
+    """抽候选词：中文 3-4 gram + 英文/代码标识符。通用 3-gram 被 BIG_STOP 过滤。
+    two_gram=True（查询侧专用）：补 2 字相邻对，用于命中索引里 jieba 切出的 2 字真词
+    （索引 n-gram 层只有 3-4 gram，2-gram 只与真词层匹配，不新增噪音源）。"""
     out = set()
     for w in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}", text):
         lw = w.lower()
@@ -263,6 +321,12 @@ def tokens(text, keep_stop=False):
             for i in range(len(run) - n + 1):
                 g = run[i:i + n]
                 if keep_stop or (g not in STOP and g not in BIG_STOP):
+                    out.add(g)
+    if two_gram:
+        for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            for i in range(len(run) - 1):
+                g = run[i:i + 2]
+                if keep_stop or g not in STOP2:
                     out.add(g)
     return out
 
@@ -344,13 +408,15 @@ def summarize_file(path):
 
     def make_doc(ct, g, seg, sec_title):
         heads = " ".join(re.findall(r"^#{1,3}\s+(.+)$", seg, re.M)[:25])
+        t = ct + " " + fname + " " + heads + " " + sec_title
         return {
             "path": os.path.relpath(path, BASE),
             "title": ct[:70],
             "gist": g[:100],
-            "w_title": Counter(tokens(ct + " " + fname + " " + heads + " " + sec_title)),
+            # 双层词：jieba 真词（懂中文，含 2 字词）+ n-gram 兜底（不漏）
+            "w_title": Counter(tokens(t) | jieba_terms(t)),
             "w_tag": Counter(t2.lower() for t2 in tags),
-            "w_body": Counter(tokens(seg[:8000])),   # 兜底保险，切块后天然够小
+            "w_body": Counter(tokens(seg[:8000]) | jieba_terms(seg[:8000])),
         }
 
     docs = []
@@ -366,6 +432,9 @@ def summarize_file(path):
 
 
 def cmd_build(a, quiet=False):
+    nw = setup_jieba_dict()
+    if not quiet:
+        print(f"  jieba 真词层：{'开启（实体词典注入 ' + str(nw) + ' 词）' if nw else '未安装 → 本次仅 n-gram（pip install jieba 可启用）'}")
     docs, n = [], 0
     for p, w in iter_files():
         ds = summarize_file(p)
@@ -391,12 +460,27 @@ def cmd_build(a, quiet=False):
     dl = {str(i): {fld: len(d[fld]) for fld in FIELDS} for i, d in enumerate(docs)}
     avgdl = {fld: (sum(dl[str(i)][fld] for i in range(len(docs))) / max(1, len(docs))) for fld in FIELDS}
     stats = {"n": len(docs), "avgdl": avgdl}
+    # SQLite 倒排索引：此前 15.8MB JSON 整体 load 占 466ms（查询预算的大头），
+    # 改点查后索引体积不再影响首字延迟，语料增长也不怕。
+    if os.path.exists(DB):
+        os.remove(DB)
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA journal_mode=OFF")
+    con.execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v BLOB)")
+    con.execute("CREATE TABLE inv(term TEXT, d INT, f INT, tf INT)")
     slim = [{k: v for k, v in d.items() if not k.startswith("w_")} for d in docs]
-    with open(IDX, "w", encoding="utf-8") as f:
-        json.dump({"docs": slim, "inv": inv, "dl": dl, "stats": stats, "fp": fingerprint()}, f, ensure_ascii=False)
+    meta = {"docs": slim, "dl": dl, "stats": stats, "fp": fingerprint()}
+    con.executemany("INSERT INTO meta VALUES(?,?)",
+                    [(k, pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)) for k, v in meta.items()])
+    fi = {f: i for i, f in enumerate(FIELDS)}
+    con.executemany("INSERT INTO inv VALUES(?,?,?,?)",
+                    ((w, i, fi[fld], cnt) for w, posts in inv.items() for (i, fld, cnt) in posts))
+    con.execute("CREATE INDEX ix_term ON inv(term)")
+    con.commit()
+    con.close()
     if not quiet:
-        size = os.path.getsize(IDX) / 1024
-        print(f"✓ 索引已建：{n} 个文件 → {len(docs)} 个检索块 / {len(inv)} 个词 / {size:.0f}KB → {os.path.relpath(IDX, BASE)}")
+        size = os.path.getsize(DB) / 1024
+        print(f"✓ 索引已建：{n} 个文件 → {len(docs)} 个检索块 / {len(inv)} 个词 / {size:.0f}KB → {os.path.relpath(DB, BASE)}")
 
 
 def fingerprint():
@@ -413,13 +497,16 @@ def fingerprint():
     return f"{n}:{newest:.0f}"
 
 
-def load_idx():
-    if not os.path.exists(IDX):
+def load_meta():
+    """只读 meta 表（docs/dl/stats/fp），倒排不进内存。"""
+    if not os.path.exists(DB):
         return None
     try:
-        with open(IDX, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+        con = sqlite3.connect(DB)
+        meta = {k: pickle.loads(v) for k, v in con.execute("SELECT k, v FROM meta")}
+        con.close()
+        return meta or None
+    except Exception:
         return None
 
 
@@ -427,24 +514,37 @@ def load_idx():
 
 def recall(text, top=TOP_N, auto=True):
     """BM25 评分的本地联想"""
-    idx = load_idx()
-    if auto and (not idx or idx.get("fp") != fingerprint()):
+    meta = load_meta()
+    if auto and (not meta or meta.get("fp") != fingerprint()):
         try:
             cmd_build(None, quiet=True)
-            idx = load_idx()
+            meta = load_meta()
         except Exception:
             pass
-    if not idx:
+    if not meta:
         return []
 
-    inv, docs = idx["inv"], idx["docs"]
-    N = idx["stats"]["n"]
-    avgdl = idx["stats"]["avgdl"]
-    dl = idx["dl"]
+    docs = meta["docs"]
+    N = meta["stats"]["n"]
+    avgdl = meta["stats"]["avgdl"]
+    dl = meta["dl"]
 
-    q_terms = tokens(text)
+    q_terms = tokens(text, two_gram=True)   # 2-gram 补丁：命中索引里的 2 字真词
     if not q_terms:
         return []
+
+    # postings 按词点查（批量 IN），不再整体加载索引
+    post = defaultdict(list)
+    con = sqlite3.connect(DB)
+    try:
+        terms = list(q_terms)
+        for k in range(0, len(terms), 400):
+            chunk = terms[k:k + 400]
+            ph = ",".join("?" * len(chunk))
+            for term, d, f, tf in con.execute(f"SELECT term,d,f,tf FROM inv WHERE term IN ({ph})", chunk):
+                post[term].append((d, FIELDS[f], tf))
+    finally:
+        con.close()
 
     # 查询里是否有"强词"（非CJK 或 4-gram 中文）？
     has_strong_q = any(not bool(re.match(r"^[\u4e00-\u9fff]+$", t)) or len(t) >= 4 for t in q_terms)
@@ -455,7 +555,7 @@ def recall(text, top=TOP_N, auto=True):
     weak_hits = defaultdict(set)    # 弱命中：普通 3-gram
 
     for t in q_terms:
-        posts = inv.get(t)
+        posts = post.get(t)
         if not posts:
             continue
         # BM25 IDF：log((N - n + 0.5) / (n + 0.5) + 1)
@@ -578,12 +678,15 @@ def cmd_audit(a):
 
 
 def cmd_stats(a):
-    idx = load_idx()
-    if not idx:
+    if not os.path.exists(DB):
         print("✗ 索引不存在，先跑 recall build"); return
-    print(f"文件 {len(idx['docs'])} / 词 {len(idx['inv'])} / "
-          f"{os.path.getsize(IDX)/1024:.0f}KB")
-    for d in idx["docs"][:100]:
+    con = sqlite3.connect(DB)
+    meta = load_meta()
+    n_term = con.execute("SELECT COUNT(DISTINCT term) FROM inv").fetchone()[0]
+    con.close()
+    print(f"文件 {len(meta['docs'])} / 词 {n_term} / "
+          f"{os.path.getsize(DB)/1024:.0f}KB")
+    for d in meta["docs"][:100]:
         print(f"  {d['path']}")
 
 
